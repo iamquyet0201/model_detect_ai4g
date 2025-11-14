@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-pillow
-python-multipart
 ultralytics
-onnxruntime
+pillow
+numpy
+python-multipart
+requests
+google-generativeai
