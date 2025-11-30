@@ -22,7 +22,6 @@ import google.generativeai as genai
 GEMINI_API_KEY = "AIzaSyBwuuO13U2Oipb37hRaCFKavAREc-Ghjkg"  # <--- THAY API KEY VÀO ĐÂY
 
 MODEL_PATH = "best.pt"
-# Dùng bản 1.5 flash ổn định nhất hiện nay
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
 PRED_CONF = 0.25
 
@@ -108,7 +107,7 @@ async def scan_gemini_labels(img: Image.Image) -> Set[str]:
         return set()
 
 # ==========================================
-# 5. PREDICT API
+# 5. PREDICT API (LOGIC CHÍNH)
 # ==========================================
 
 @app.post("/predict/")
@@ -119,7 +118,6 @@ async def predict(file: UploadFile = File(...)):
     content = await file.read()
     try:
         img = Image.open(io.BytesIO(content)).convert("RGB")
-        # Resize để xử lý nhanh hơn
         img.thumbnail((1024, 1024)) 
     except:
         return JSONResponse({"error": "Lỗi file ảnh"}, status_code=400)
@@ -133,27 +131,27 @@ async def predict(file: UploadFile = File(...)):
             "message": f"⚠️ CẢNH BÁO: {reason}"
         }, status_code=400)
 
-    # 3. YOLO Detect
+    # 3. YOLO Detect (Có NMS để lọc trùng)
     yolo_counts = Counter()
     detections = []
     
     if model:
-        results = model.predict(img, conf=PRED_CONF, verbose=False)[0]
+        # Thêm agnostic_nms=True để lọc trùng lặp tốt hơn
+        results = model.predict(img, conf=PRED_CONF, iou=0.5, agnostic_nms=True, verbose=False)[0]
         for box in results.boxes:
             c = int(box.cls[0])
             lbl = results.names[c]
             yolo_counts[lbl] += 1
-            # Lưu box để vẽ hình (nếu cần)
             detections.append({"box": box.xyxy[0].tolist(), "label": lbl})
 
-    # 4. Gemini Scan (Lấy danh sách loại vật liệu)
+    # 4. Gemini Scan
     gemini_labels = await scan_gemini_labels(img)
     
-    # 5. LOGIC KẾT HỢP (HYBRID LOGIC)
+    # 5. LOGIC KẾT HỢP (Final Merge)
     final_items = []
     processed_labels = set()
 
-    # A. Duyệt qua kết quả YOLO
+    # A. Xử lý những cái YOLO nhìn thấy
     for lbl, count in yolo_counts.items():
         name_vi = LABEL_MAP_VI.get(lbl, lbl)
         processed_labels.add(lbl)
@@ -162,34 +160,36 @@ async def predict(file: UploadFile = File(...)):
             "name": lbl,
             "label": name_vi,
             "quantity": count,
-            "manual_input_required": False # Mặc định tin YOLO
+            "manual_input_required": False
         }
 
         if gemini_labels:
             if lbl in gemini_labels:
-                # Cả 2 cùng thấy -> Tin tưởng tuyệt đối
+                # Cả 2 cùng thấy -> Tin số lượng YOLO
                 item["note"] = "✅ Verified"
             else:
-                # YOLO thấy mà Gemini không thấy -> Nghi ngờ
-                item["manual_input_required"] = True # Hiện ô nhập đỏ
-                item["quantity"] = -1 # Để user tự điền
-                item["note"] = "⚠️ YOLO nghi ngờ"
+                # YOLO thấy, Gemini không thấy -> Vẫn hiện, nhưng đánh dấu để user check
+                # (Không bắt nhập tay, cứ để số lượng YOLO gợi ý)
+                item["note"] = "⚠️ Kiểm tra lại"
+                # Nếu muốn bắt nhập tay thì uncomment dòng dưới:
+                # item["manual_input_required"] = True 
+                # item["quantity"] = 0
         
         final_items.append(item)
 
-    # B. Duyệt qua kết quả Gemini (Những cái YOLO bỏ sót)
+    # B. Xử lý những cái Gemini thấy thêm (YOLO bỏ sót)
     for lbl in gemini_labels:
         if lbl not in processed_labels:
             name_vi = LABEL_MAP_VI.get(lbl, lbl)
             final_items.append({
                 "name": lbl,
                 "label": name_vi,
-                "quantity": -1, # Gemini không đếm được -> User nhập
-                "manual_input_required": True,
+                "quantity": 0, # Để 0 để báo hiệu chưa đếm được
+                "manual_input_required": True, # Bắt buộc nhập tay
                 "note": "✨ Gemini phát hiện thêm"
             })
 
-    # 6. Vẽ hình minh họa (Optional)
+    # 6. Vẽ hình
     draw_img = img.copy()
     draw = ImageDraw.Draw(draw_img)
     for det in detections:
@@ -197,7 +197,6 @@ async def predict(file: UploadFile = File(...)):
 
     print(f"Done in {time.time() - start:.2f}s")
 
-    # Trả về đúng cấu trúc items mà frontend JS cần
     return {
         "items": final_items,
         "image": pil_to_base64(draw_img)
